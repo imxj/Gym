@@ -14,28 +14,32 @@ browser_gym_openai_model:
   responses_api_models:
     openai_model:
       entrypoint: app.py
-      openai_base_url: https://api.openai.com/v1
+      openai_base_url: https://inference-api.nvidia.com
       openai_api_key: ${cua_openai_api_key}
-      openai_model: computer-use-preview
+      openai_model: openai/openai/gpt-5.4
       openai_organization: ${cua_openai_org}
 browser_gym_anthropic_sonnet_model:
   responses_api_models:
-    anthropic_model:
+    openai_model:
       entrypoint: app.py
-      anthropic_api_key: ${cua_anthropic_api_key}
-      anthropic_model: claude-sonnet-4-20250514
+      openai_base_url: https://inference-api.nvidia.com
+      openai_api_key: ${cua_openai_api_key}
+      openai_model: azure/anthropic/claude-sonnet-4-6
+      openai_organization: ${cua_openai_org}
 browser_gym_anthropic_opus_model:
   responses_api_models:
-    anthropic_model:
+    openai_model:
       entrypoint: app.py
-      anthropic_api_key: ${cua_anthropic_api_key}
-      anthropic_model: claude-opus-4-6
+      openai_base_url: https://inference-api.nvidia.com
+      openai_api_key: ${cua_openai_api_key}
+      openai_model: aws/anthropic/bedrock-claude-opus-4-6
+      openai_organization: ${cua_openai_org}
 browser_openai_agent:
   responses_api_agents:
     browser_agent:
       entrypoint: app.py
-      cua_adapter_type: openai
-      cua_model: computer-use-preview
+      cua_adapter_type: vision
+      cua_model: openai/openai/gpt-5.4
       max_steps: 250
       viewport_width: 1280
       viewport_height: 720
@@ -57,12 +61,8 @@ browser_anthropic_sonnet_agent:
   responses_api_agents:
     browser_agent:
       entrypoint: app.py
-      cua_adapter_type: anthropic_sonnet
-      cua_model: claude-sonnet-4-20250514
-      cua_is_opus: false
-      cua_max_tokens: 4096
-      cua_turns_to_keep: 8
-      cua_screenshot_turn_limit: 8
+      cua_adapter_type: vision
+      cua_model: azure/anthropic/claude-sonnet-4-6
       max_steps: 250
       viewport_width: 1280
       viewport_height: 720
@@ -84,13 +84,8 @@ browser_anthropic_opus_agent:
   responses_api_agents:
     browser_agent:
       entrypoint: app.py
-      cua_adapter_type: anthropic_opus
-      cua_model: claude-opus-4-6
-      cua_is_opus: true
-      cua_effort_level: high
-      cua_max_tokens: 4096
-      cua_turns_to_keep: 8
-      cua_screenshot_turn_limit: 8
+      cua_adapter_type: vision
+      cua_model: aws/anthropic/bedrock-claude-opus-4-6
       max_steps: 250
       viewport_width: 1280
       viewport_height: 720
@@ -110,17 +105,18 @@ browser_anthropic_opus_agent:
         license: Apache 2.0
 browser_gym_gemini_model:
   responses_api_models:
-    gemini_model:
+    openai_model:
       entrypoint: app.py
-      gemini_api_key: ${cua_gemini_api_key}
-      gemini_model: gemini-2.5-computer-use-preview-10-2025
+      openai_base_url: https://inference-api.nvidia.com
+      openai_api_key: ${cua_openai_api_key}
+      openai_model: gcp/google/gemini-3.1-pro-preview
+      openai_organization: ${cua_openai_org}
 browser_gemini_agent:
   responses_api_agents:
     browser_agent:
       entrypoint: app.py
-      cua_adapter_type: gemini
-      cua_model: gemini-2.5-computer-use-preview-10-2025
-      cua_max_conversation_turns: 8
+      cua_adapter_type: vision
+      cua_model: gcp/google/gemini-3.1-pro-preview
       max_steps: 250
       viewport_width: 1280
       viewport_height: 720

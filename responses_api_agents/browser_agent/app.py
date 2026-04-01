@@ -198,6 +198,9 @@ class BrowserAgent(SimpleResponsesAPIAgent):
             kwargs["max_conversation_turns"] = self.config.cua_max_conversation_turns
             kwargs["api_caller"] = self._make_gemini_model_server_caller(cookie_jar)
 
+        elif adapter_type == "vision":
+            kwargs["api_caller"] = self._make_openai_model_server_caller(cookie_jar)
+
         return AdapterFactory.create(adapter_type, **kwargs)
 
     def _make_openai_model_server_caller(self, cookie_jar: Dict[str, Any]):
