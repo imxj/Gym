@@ -1,0 +1,60 @@
+webarena_resources_server:
+  resources_servers:
+    webarena:
+      entrypoint: app.py
+      domain: agent
+      description: WebArena classic benchmark environment. Models browse live self-hosted WebArena sites (shopping, shopping_admin, reddit, gitlab, wikipedia, map) via screenshots and CUA actions; rewards come from the classic evaluators (string_match / url_match / program_html).
+      value: Improve web navigation and task completion on realistic multi-page websites
+      max_concurrent_browsers: ${webarena_max_concurrent_browsers}
+      browser_pool_size: ${webarena_browser_pool_size}
+      default_viewport_width: 1280
+      default_viewport_height: 720
+      site_urls:
+        shopping: ${wa_shopping}
+        shopping_admin: ${wa_shopping_admin}
+        reddit: ${wa_reddit}
+        gitlab: ${wa_gitlab}
+        wikipedia: ${wa_wikipedia}
+        map: ${wa_map}
+      judge_model_server:
+        type: responses_api_models
+        name: webarena_judge_model
+      verified: false
+webarena_judge_model:
+  responses_api_models:
+    openai_model:
+      entrypoint: app.py
+      openai_base_url: ${webarena_judge_base_url}
+      openai_api_key: ${webarena_judge_api_key}
+      openai_model: ${webarena_judge_model_name}
+webarena_policy_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${policy_base_url}
+      api_key: ${policy_api_key}
+      model: ${policy_model_name}
+      uses_reasoning_parser: true
+webarena_vision_agent:
+  responses_api_agents:
+    browser_agent:
+      entrypoint: app.py
+      cua_adapter_type: vision
+      cua_model: ${policy_model_name}
+      max_steps: 30
+      viewport_width: 1280
+      viewport_height: 720
+      cua_debug_trajectories: false
+      cua_debug_output_dir: results/webarena_debug_trajectories
+      resources_server:
+        type: resources_servers
+        name: webarena_resources_server
+      model_server:
+        type: responses_api_models
+        name: webarena_policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/webarena/data/example.jsonl
+        num_repeats: 1
+        license: Apache 2.0

@@ -1,0 +1,17 @@
+{
+  "command": "webarena/conversion/convert_webarena_to_nemo_gym.py --input /lustre/fsw/portfolios/nvr/users/mingjiel/workspace/osworld_internal/webarena/benchmarks/webarena.jsonl --output /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/jinx/workspace/projects/nemo-rl-browser/3rdparty/Gym-workspace/Gym/resources_servers/webarena/data/example.jsonl --task-ids webarena-0 webarena-1 webarena-2 webarena-44 webarena-356",
+  "timestamp": "2026-07-29T23:13:13.026639",
+  "input": "/lustre/fsw/portfolios/nvr/users/mingjiel/workspace/osworld_internal/webarena/benchmarks/webarena.jsonl",
+  "output": "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/jinx/workspace/projects/nemo-rl-browser/3rdparty/Gym-workspace/Gym/resources_servers/webarena/data/example.jsonl",
+  "num_input_rows": 5,
+  "num_output_rows": 5,
+  "task_type_counts": {
+    "non_state_change": 4,
+    "state_change": 1
+  },
+  "eval_type_counts": {
+    "string_match": 3,
+    "url_match": 1,
+    "program_html": 1
+  }
+}
