@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from responses_api_agents.browser_agent.adapters.base import BaseCUAAdapter, CUAAdapterResponse
+from responses_api_agents.browser_agent.adapters.nemotron_toolcall_adapter import NemotronToolCallAdapter
 from responses_api_agents.browser_agent.adapters.openai_adapter import OpenAICUAAdapter
 from responses_api_agents.browser_agent.adapters.vision_adapter import VisionCUAAdapter
 
@@ -19,6 +20,7 @@ from responses_api_agents.browser_agent.adapters.vision_adapter import VisionCUA
 _ADAPTER_REGISTRY: dict[str, type[BaseCUAAdapter]] = {
     "openai": OpenAICUAAdapter,
     "vision": VisionCUAAdapter,
+    "nemotron_toolcall": NemotronToolCallAdapter,
 }
 
 try:

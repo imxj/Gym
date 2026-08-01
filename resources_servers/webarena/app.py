@@ -24,9 +24,8 @@ Extends the generic browser_gym CUA server (browser pool, /step, /close) with:
   sites in a fresh authenticated context.
 
 The reward is the product of all eval_types (0.0 or 1.0 for classic tasks).
-Ported from osworld_internal webarena/common/classic_evaluation.py; `func:`
-site-API helper locators/URLs are not yet supported and score 0.0 with an
-explicit marker in verification_result.
+Ported from osworld_internal webarena/common/classic_evaluation.py, including
+the `func:` site-API helpers (see site_api_helpers.py).
 """
 
 from __future__ import annotations
@@ -246,9 +245,7 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
     # string_match (+ LLM judge)
     ########################################
 
-    async def _string_match(
-        self, eval_cfg: Dict[str, Any], intent: str, answer: str, detail: Dict[str, Any]
-    ) -> float:
+    async def _string_match(self, eval_cfg: Dict[str, Any], intent: str, answer: str, detail: Dict[str, Any]) -> float:
         score, pending = string_match_local(eval_cfg, intent, answer)
         for judge_request in pending:
             score *= await self._resolve_judge_request(judge_request, detail)
@@ -380,17 +377,14 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
             except Exception:
                 selected_element = ""
         elif locator.startswith("func:"):
-            selected_element = str(
-                await resolve_helper_expression(locator, self._get_site_api(), page, page.url)
-            )
+            selected_element = str(await resolve_helper_expression(locator, self._get_site_api(), page, page.url))
         else:
             raise ValueError(f"Unknown program_html locator: {locator}")
 
         selected_element = html_lib.unescape(selected_element)
         target_score = score_program_html_required(target["required_contents"], selected_element)
         detail["messages"].append(
-            f"program_html: url={url!r} locator={locator!r} score={target_score} "
-            f"extracted={selected_element[:200]!r}"
+            f"program_html: url={url!r} locator={locator!r} score={target_score} extracted={selected_element[:200]!r}"
         )
         return target_score
 

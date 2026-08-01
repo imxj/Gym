@@ -245,9 +245,7 @@ async def test_resolve_helper_expression_dispatch():
     )
     # __page__ resolves to the live page object.
     assert (
-        await sah.resolve_helper_expression(
-            "func:gitlab_get_project_memeber_role(__page__, 'vinta')", api, page, "x"
-        )
+        await sah.resolve_helper_expression("func:gitlab_get_project_memeber_role(__page__, 'vinta')", api, page, "x")
         == "PAGE:vinta"
     )
 
@@ -325,9 +323,7 @@ def _judge_response_payload(judgement: str) -> dict:
             NeMoGymResponseOutputMessage(
                 id="msg_judge",
                 content=[
-                    NeMoGymResponseOutputText(
-                        annotations=[], text=f'{{"judgement": "{judgement}", "reasoning": "r"}}'
-                    )
+                    NeMoGymResponseOutputText(annotations=[], text=f'{{"judgement": "{judgement}", "reasoning": "r"}}')
                 ],
                 role="assistant",
                 status="completed",
@@ -378,9 +374,7 @@ async def test_verify_string_match_fuzzy_with_judge(monkeypatch):
         judge_model_server=ModelServerRef(type="responses_api_models", name="webarena_judge_model"),
     )
     server.server_client.post = AsyncMock(return_value=MagicMock())
-    monkeypatch.setattr(
-        webarena_app, "get_response_json", AsyncMock(return_value=_judge_response_payload("correct"))
-    )
+    monkeypatch.setattr(webarena_app, "get_response_json", AsyncMock(return_value=_judge_response_payload("correct")))
     body = _make_verify_request(
         final_message="roughly thirty dollars",
         step_urls=[],

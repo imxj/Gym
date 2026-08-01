@@ -68,6 +68,11 @@ class BrowserAgentConfig(BaseResponsesAPIAgentConfig):
     cua_turns_to_keep: int = 8
     cua_screenshot_turn_limit: int = 8
     cua_max_conversation_turns: int = 8
+    # nemotron_toolcall adapter: screenshots kept as images, and the text-token
+    # budget the history is compacted into (0 disables text compaction).
+    cua_max_image_history: int = 3
+    cua_max_model_len: int = 131072
+    cua_thinking: bool = True
     max_steps: int = 250
     run_timeout_seconds: float = 7200.0
     viewport_width: int = 1280
@@ -200,6 +205,21 @@ class BrowserAgent(SimpleResponsesAPIAgent):
 
         elif adapter_type == "vision":
             kwargs["api_caller"] = self._make_openai_model_server_caller(cookie_jar)
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            if top_p is not None:
+                kwargs["top_p"] = top_p
+
+        elif adapter_type == "nemotron_toolcall":
+            kwargs["api_caller"] = self._make_openai_model_server_caller(cookie_jar)
+            kwargs["max_image_history"] = self.config.cua_max_image_history
+            kwargs["max_model_len"] = self.config.cua_max_model_len
+            kwargs["max_output_tokens"] = self.config.cua_max_tokens
+            kwargs["thinking"] = self.config.cua_thinking
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            if top_p is not None:
+                kwargs["top_p"] = top_p
 
         return AdapterFactory.create(adapter_type, **kwargs)
 

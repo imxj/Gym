@@ -273,9 +273,7 @@ def string_match_local(eval_cfg: Dict[str, Any], intent: str, answer: Any) -> Tu
             for must_value in value:
                 alternatives = reference_alternatives(must_value)
                 required_groups.append(alternatives)
-                rule_score *= max(
-                    must_include(ref=alt, pred=pred, tokenize=(len(value) == 1)) for alt in alternatives
-                )
+                rule_score *= max(must_include(ref=alt, pred=pred, tokenize=(len(value) == 1)) for alt in alternatives)
             if rule_score == 1.0:
                 score *= rule_score
             else:

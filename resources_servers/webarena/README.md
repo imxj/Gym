@@ -44,6 +44,36 @@ token per site; HTTP goes through NeMo-Gym's global aiohttp client.
 - WebArena sites must be reachable and reset out-of-band (the standalone harness's
   `reset_webarena_env.sh` reset service); this server does not reset sites.
 
+## Agent / policy interface
+
+Two agent instances are configured; they differ only in the `browser_agent` adapter:
+
+| agent | adapter | protocol | use for |
+|---|---|---|---|
+| `webarena_nemotron_agent` | `nemotron_toolcall` | **native tool calls**, 5 harness tools, normalized [0,1] coordinates, `terminate(status, answer)` | Nemotron/holotron checkpoints trained on internal browser trajectories; RL rollouts |
+| `webarena_vision_agent` | `vision` | one JSON action object in plain text, pixel coordinates | frontier API models (GPT/Claude/Gemini) that were never trained on our tool schema |
+
+`adapters/nemotron_toolcall_adapter.py` replicates the internal harness policy
+interface (`osworld_internal webarena/nvidia/nemotron_toolcall_agent.py`): system
+prompt and the five tool definitions are verbatim, `computer` carries a sequence
+of actions, coordinates stay normalized until they are mapped onto pixel
+`BrowserAction`s, and the terminal `terminate` answer becomes `final_message` —
+which is exactly what `string_match` scores. History compaction is ported too:
+only the last `cua_max_image_history` screenshots stay as images, and whole
+oldest turns are dropped (with a redaction notice) to fit a text budget derived
+from `cua_max_model_len`.
+
+**Serving requirement:** this adapter needs vLLM started with
+`--enable-auto-tool-choice` and the model's `--tool-call-parser`. Without them
+the model's tool calls never reach the `tool_calls` field, every step parses as
+"no tool call", and rewards read as 0 with no error.
+
+Irreducible differences from the harness (worth weighing before comparing
+numbers to standalone eval runs): observations are **headless Playwright
+viewport** screenshots rather than full 1920x1080 X-display grabs (no browser
+chrome), actions execute via Playwright rather than pyautogui, and there is no
+Cloudflare/captcha handler.
+
 ## Configuration
 
 All wiring is YAML (no env vars). `configs/webarena.yaml` expects these keys in the
