@@ -157,3 +157,44 @@ Tier 0/1 only — no browser, no model, no sites:
 ```bash
 cd resources_servers/webarena && pytest -x
 ```
+
+## Smoke testing against live sites (no model, no GPU)
+
+`tools/smoke_e2e.py` stages the expensive parts so failures isolate cheaply.
+Run each from the Gym root; every stage writes a `*_smoke_stats.json`.
+
+```bash
+# 1. Playwright + browser pool work here at all (no network)
+python resources_servers/webarena/tools/smoke_e2e.py browser
+
+# 2. Scripted site logins — inspect the screenshots, don't trust the exit code
+python resources_servers/webarena/tools/smoke_e2e.py login --sites shopping_admin gitlab reddit shopping
+
+# 3. Evaluator vs live sites: score a synthetic *gold* trajectory per task
+python resources_servers/webarena/tools/smoke_e2e.py verify-replay \
+    --data resources_servers/webarena/data/webarena_validation.jsonl --limit 60
+```
+
+Stage 3 classifies every task so a single ratio can't hide a bug:
+
+| outcome | meaning |
+|---|---|
+| `pass` | gold trajectory scored 1.0 — expected for exact_match / must_include / url_match |
+| `needs_judge` | fuzzy_match task; unscorable without a judge model server wired up |
+| `program_html_live_state` | check reads site state a gold trajectory never produced |
+| `UNEXPECTED` | **a real bug in the evaluator port — must be 0** |
+
+Reference run (2026-08-01, 60 tasks): `pass=41`, `needs_judge=19`, `UNEXPECTED=0`;
+logins 4/4; browser OK.
+
+### Site URLs drift
+
+The addresses in the standalone harness's `webarena/nvidia/export_vars.sh`
+(`10.131.133.31:*`) were unroutable as of 2026-08-01; the sites answered on the
+EC2 host referenced by `reset_webarena_env.sh`. **Confirm the current host with
+whoever owns the deployment** and set it once in `env.yaml` (`wa_*` keys) rather
+than hard-coding it anywhere — this repo reads the values only from config.
+
+Full rollouts (`ng_run` + `ng_collect_rollouts`) additionally need a served
+policy model, and `ng_run` starts each server from its own per-server `.venv`;
+run it in the environment those venvs were built for.
