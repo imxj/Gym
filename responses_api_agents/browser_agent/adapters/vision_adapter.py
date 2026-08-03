@@ -338,7 +338,7 @@ class VisionCUAAdapter(BaseCUAAdapter):
                 clear_before_typing=action_data.get("clear_before_typing"),
             )
         elif action_type == "keypress":
-            keys = action_data.get("keys", [])
+            keys = action_data.get("keys") or []
             if isinstance(keys, str):
                 keys = [keys]
             # Handle special aliases
