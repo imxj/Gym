@@ -18,14 +18,15 @@ browser_agent works against this server unchanged; extends only the config
 (site URLs, credentials, judge model) and the seed request.
 """
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from nemo_gym.config_types import ModelServerRef
 from resources_servers.browser_gym.schemas import (
     BrowserGymResourcesServerConfig,
     CUASeedSessionRequest,
+    CUAVerifyResponse,
 )
 
 
@@ -37,6 +38,30 @@ DEFAULT_SITE_CREDENTIALS: Dict[str, Dict[str, str]] = {
     "gitlab": {"username": "byteblaze", "password": "hello1234"},
     "classifieds": {"username": "blake.sullivan@gmail.com", "password": "Password.123"},
 }
+
+
+# Termination reasons that make the reward unreliable: the failure is the
+# environment's (or the eval infrastructure's), not the policy's, so the RL
+# trainer should drop the sample instead of learning from a bogus 0.
+# Deliberately NOT masked: "max_steps" (running out of steps without finishing
+# is a genuine failure, matching the standalone harness's "fail" status).
+DEFAULT_MASKED_TERMINATION_REASONS: List[str] = [
+    # agent/browser infrastructure
+    "browser_stuck",
+    "adapter_error",
+    "adapter_init_error",
+    "run_timeout",
+    "empty_trajectory",
+    # model protocol exhaustion (harness parity: status=error, eval skipped)
+    "no_tool_calls",
+    "unparseable_action",
+    # verify-side infrastructure
+    "judge_unavailable",
+    "judge_call_failed",
+    "program_html_infra_error",
+    "site_api_error",
+    "verification_error",
+]
 
 
 class WebArenaResourcesServerConfig(BrowserGymResourcesServerConfig):
@@ -56,7 +81,24 @@ class WebArenaResourcesServerConfig(BrowserGymResourcesServerConfig):
     # program_html evaluation
     program_html_wait_seconds: float = 3.0
     verify_navigation_timeout_ms: int = 60000
+    # Termination reasons whose rewards are masked for the RL trainer.
+    masked_termination_reasons: List[str] = Field(default_factory=lambda: list(DEFAULT_MASKED_TERMINATION_REASONS))
 
 
 class WebArenaSeedSessionRequest(CUASeedSessionRequest):
     """start_url may contain site placeholders (e.g. "__SHOPPING_ADMIN__")."""
+
+
+class WebArenaVerifyResponse(CUAVerifyResponse):
+    """CUA verify response plus the unreliable-reward contract.
+
+    mask_sample=True means "do not train on this reward" — the episode or its
+    verification failed for an infrastructure reason listed in
+    ``masked_termination_reasons`` (the formalization of the standalone
+    harness's "status=error, evaluation skipped").
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    mask_sample: bool = False
+    termination_reason: Optional[str] = None

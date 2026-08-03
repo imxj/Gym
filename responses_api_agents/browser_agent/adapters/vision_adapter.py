@@ -19,6 +19,7 @@ Sends screenshots as images, instructs the model to return JSON browser actions.
 Manages conversation history client-side with turn-based trimming.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -107,11 +108,25 @@ BROWSER_ACTION_SCHEMA = {
         "action_type": {
             "type": "string",
             "enum": [
-                "click", "double_click", "triple_click", "right_click", "middle_click",
-                "hover", "drag", "type", "keypress", "scroll",
-                "goto", "go_back", "go_forward",
-                "new_tab", "close_tab", "switch_tab",
-                "screenshot", "wait", "done",
+                "click",
+                "double_click",
+                "triple_click",
+                "right_click",
+                "middle_click",
+                "hover",
+                "drag",
+                "type",
+                "keypress",
+                "scroll",
+                "goto",
+                "go_back",
+                "go_forward",
+                "new_tab",
+                "close_tab",
+                "switch_tab",
+                "screenshot",
+                "wait",
+                "done",
             ],
         },
         "coordinate": {"type": ["array", "null"], "items": {"type": "number"}},
@@ -143,6 +158,9 @@ class VisionCUAAdapter(BaseCUAAdapter):
         api_caller=None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        parse_retries: int = 3,
+        parse_error_feedback: bool = False,
+        retry_sleep_seconds: float = 1.0,
     ):
         self._model = model
         self._viewport_width = viewport_width
@@ -151,6 +169,9 @@ class VisionCUAAdapter(BaseCUAAdapter):
         self._api_caller = api_caller
         self._temperature = temperature
         self._top_p = top_p
+        self._parse_retries = max(1, parse_retries)
+        self._parse_error_feedback = parse_error_feedback
+        self._retry_sleep_seconds = retry_sleep_seconds
         self._messages: List[Dict[str, Any]] = []
         self._system_prompt = ""
 
@@ -163,7 +184,7 @@ class VisionCUAAdapter(BaseCUAAdapter):
         """Keep only the last N turns to avoid context overflow."""
         if len(self._messages) > self._max_turns_to_keep * 2:
             # Keep system context (first user message) and recent turns
-            self._messages = self._messages[:1] + self._messages[-(self._max_turns_to_keep * 2 - 1):]
+            self._messages = self._messages[:1] + self._messages[-(self._max_turns_to_keep * 2 - 1) :]
 
     def _build_user_content(self, text: str, screenshot_b64: str) -> List[Dict[str, Any]]:
         return [
@@ -283,29 +304,52 @@ class VisionCUAAdapter(BaseCUAAdapter):
         # pyautogui.scroll(y) or pyautogui.scroll(y, x=x, y=y)
         m = re.search(r"pyautogui\.scroll\(\s*(-?[0-9.]+)", text)
         if m:
-            return {"action_type": "scroll", "coordinate": [640, 360], "scroll_x": 0, "scroll_y": int(float(m.group(1)))}
+            return {
+                "action_type": "scroll",
+                "coordinate": [640, 360],
+                "scroll_x": 0,
+                "scroll_y": int(float(m.group(1))),
+            }
         return None
 
     # Normalize model-generated action types to canonical forms
     _ACTION_ALIASES: Dict[str, str] = {
-        "left_click": "click", ".click": "click", " click": "click",
-        "stock_click": "click", "green_click": "click",
-        "doubleclick": "double_click", "dclick": "double_click",
+        "left_click": "click",
+        ".click": "click",
+        " click": "click",
+        "stock_click": "click",
+        "green_click": "click",
+        "doubleclick": "double_click",
+        "dclick": "double_click",
         "rightclick": "right_click",
-        "write": "type", "typeify": "type",
-        "press": "keypress", "press_enter": "keypress",
+        "write": "type",
+        "typeify": "type",
+        "press": "keypress",
+        "press_enter": "keypress",
         "machine_keypress": "keypress",
-        "move": "hover", "moveto": "hover", "mouseup": "hover",
-        "back": "go_back", "browser_back": "go_back", "go": "goto",
+        "move": "hover",
+        "moveto": "hover",
+        "mouseup": "hover",
+        "back": "go_back",
+        "browser_back": "go_back",
+        "go": "goto",
         "refresh": "screenshot",
-        "think": "screenshot", "analyze": "screenshot", "pause": "screenshot",
-        "ping": "screenshot", "clipboard": "screenshot",
-        "scrolledown": "scroll", "scrolled": "scroll", "scrolldown": "scroll",
+        "think": "screenshot",
+        "analyze": "screenshot",
+        "pause": "screenshot",
+        "ping": "screenshot",
+        "clipboard": "screenshot",
+        "scrolledown": "scroll",
+        "scrolled": "scroll",
+        "scrolldown": "scroll",
         "scrollup": "scroll",
-        "delay": "wait", "time": "wait",
+        "delay": "wait",
+        "time": "wait",
         "select_all": "keypress",
         "clear": "keypress",
-        "quit": "done", "terminate": "done", "stop": "done",
+        "quit": "done",
+        "terminate": "done",
+        "stop": "done",
     }
 
     def _map_action(self, action_data: Dict[str, Any]) -> Optional[BrowserAction]:
@@ -384,8 +428,8 @@ class VisionCUAAdapter(BaseCUAAdapter):
             logger.warning("Unknown action type '%s', falling back to screenshot", raw_type)
             return BrowserAction(action_type="screenshot")
 
-    def _parse_response(self, response: Dict[str, Any]) -> CUAAdapterResponse:
-        """Parse the responses API output into CUAAdapterResponse."""
+    @staticmethod
+    def _extract_text(response: Dict[str, Any]) -> str:
         output = response.get("output", [])
         text = ""
         for item in output:
@@ -393,11 +437,20 @@ class VisionCUAAdapter(BaseCUAAdapter):
                 for block in item.get("content", []):
                     if block.get("type") == "output_text":
                         text += block.get("text", "")
+        return text
 
-        # Store assistant response in history
+    def _finalize(
+        self,
+        response: Dict[str, Any],
+        text: str,
+        action_data: Optional[Dict[str, Any]],
+        termination_reason: Optional[str] = None,
+        strip_token_ids: bool = False,
+    ) -> CUAAdapterResponse:
+        """Commit the accepted assistant turn to history and map its action."""
+        # Discarded retry attempts never reach this point, so history only ever
+        # carries the accepted turn.
         self._messages.append({"role": "assistant", "content": text})
-
-        action_data = self._parse_action_json(text)
 
         actions = []
         message = None
@@ -415,9 +468,10 @@ class VisionCUAAdapter(BaseCUAAdapter):
                     done = True
                     message = text
         else:
-            # Couldn't parse JSON — treat as done with message
+            # Parse retries exhausted — end the episode and mark why.
             done = True
             message = text
+            termination_reason = termination_reason or "unparseable_action"
 
         usage = None
         resp_usage = response.get("usage")
@@ -426,18 +480,80 @@ class VisionCUAAdapter(BaseCUAAdapter):
             out_tok = resp_usage.get("output_tokens", 0) or 0
             usage = CUAAdapterUsage(input_tokens=in_tok, output_tokens=out_tok, total_tokens=in_tok + out_tok)
 
-        token_ids = extract_token_ids_from_response(response)
+        if strip_token_ids:
+            # Feedback-mode recovery: the accepted call's prompt included
+            # transient messages never persisted to history, so its token IDs
+            # cannot be aligned with the recorded context.
+            token_ids = {"prompt_token_ids": [], "generation_token_ids": [], "generation_log_probs": []}
+        else:
+            token_ids = extract_token_ids_from_response(response)
 
         return CUAAdapterResponse(
             actions=actions,
             message=message,
             raw_response=response,
             done=done,
+            termination_reason=termination_reason,
             usage=usage,
             prompt_token_ids=token_ids["prompt_token_ids"],
             generation_token_ids=token_ids["generation_token_ids"],
             generation_log_probs=token_ids["generation_log_probs"],
         )
+
+    def _parse_response(self, response: Dict[str, Any]) -> CUAAdapterResponse:
+        """Single-attempt parse (no retries); used by tests and as a reference."""
+        text = self._extract_text(response)
+        return self._finalize(response, text, self._parse_action_json(text))
+
+    async def _request_with_retries(self) -> CUAAdapterResponse:
+        """Call the model, resampling up to parse_retries times on unparseable output.
+
+        Blind resamples by default (harness parity); with parse_error_feedback
+        the retry request transiently carries the failed output plus a
+        corrective user message, neither of which is persisted to history.
+        """
+        extra_messages: List[Dict[str, Any]] = []
+        response: Dict[str, Any] = {}
+        text = ""
+
+        for attempt in range(self._parse_retries):
+            response = await self._call_api(self._build_payload(extra_messages))
+            text = self._extract_text(response)
+            action_data = self._parse_action_json(text)
+            if action_data is not None:
+                if attempt:
+                    logger.info("Recovered a parseable action on retry %d", attempt + 1)
+                return self._finalize(
+                    response,
+                    text,
+                    action_data,
+                    # Feedback retries change the prompt the accepted call saw.
+                    strip_token_ids=bool(attempt and self._parse_error_feedback),
+                )
+
+            logger.warning("Unparseable action output (attempt %d/%d)", attempt + 1, self._parse_retries)
+            if attempt + 1 < self._parse_retries:
+                if self._parse_error_feedback:
+                    extra_messages = [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "Your previous response was not a valid action. Reply with exactly "
+                                        "ONE JSON action object matching the documented schema."
+                                    ),
+                                }
+                            ],
+                        },
+                    ]
+                if self._retry_sleep_seconds > 0:
+                    await asyncio.sleep(self._retry_sleep_seconds)
+
+        logger.warning("Parse retries exhausted (%d attempts); ending episode", self._parse_retries)
+        return self._finalize(response, text, None, termination_reason="unparseable_action")
 
     async def initialize(self, task_prompt: str, screenshot_b64: str) -> CUAAdapterResponse:
         self._messages = []
@@ -452,17 +568,14 @@ class VisionCUAAdapter(BaseCUAAdapter):
         )
         self._messages.append({"role": "user", "content": user_content})
 
-        payload = self._build_payload()
+        return await self._request_with_retries()
 
-        response = await self._call_api(payload)
-        return self._parse_response(response)
-
-    def _build_payload(self) -> Dict[str, Any]:
+    def _build_payload(self, extra_messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """Build the API payload with sampling params from the training config."""
         payload = {
             "model": self._model,
             "instructions": self._system_prompt,
-            "input": self._messages,
+            "input": self._messages + list(extra_messages or []),
             "max_output_tokens": 1024,
             "text": {
                 "format": {
@@ -490,10 +603,7 @@ class VisionCUAAdapter(BaseCUAAdapter):
         user_content = self._build_user_content(feedback, screenshot_b64)
         self._messages.append({"role": "user", "content": user_content})
 
-        payload = self._build_payload()
-
-        response = await self._call_api(payload)
-        return self._parse_response(response)
+        return await self._request_with_retries()
 
     def reset(self):
         self._messages = []

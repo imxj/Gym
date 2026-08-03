@@ -57,6 +57,12 @@ webarena_nemotron_agent:
       cua_max_model_len: 131072
       cua_max_tokens: 16384
       cua_thinking: true
+      # 3 total attempts per step on no-tool-call (first call + 2 blind
+      # resamples) = internal-harness parity; set cua_parse_error_feedback:
+      # true for OSWorld-style corrective retries (recovered turns then carry
+      # no RL token IDs — see README).
+      cua_parse_retries: 3
+      cua_parse_error_feedback: false
       cua_debug_trajectories: false
       cua_debug_output_dir: results/webarena_debug_trajectories
       resources_server:

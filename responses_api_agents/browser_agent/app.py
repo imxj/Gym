@@ -73,6 +73,12 @@ class BrowserAgentConfig(BaseResponsesAPIAgentConfig):
     cua_max_image_history: int = 3
     cua_max_model_len: int = 131072
     cua_thinking: bool = True
+    # Parse retries per step for nemotron_toolcall/vision adapters: blind
+    # resamples on no-tool-call / unparseable output (3 = internal-harness
+    # parity). cua_parse_error_feedback=True switches retries to carry a
+    # transient corrective message (OSWorld-PR style).
+    cua_parse_retries: int = 3
+    cua_parse_error_feedback: bool = False
     max_steps: int = 250
     run_timeout_seconds: float = 7200.0
     viewport_width: int = 1280
@@ -205,6 +211,8 @@ class BrowserAgent(SimpleResponsesAPIAgent):
 
         elif adapter_type == "vision":
             kwargs["api_caller"] = self._make_openai_model_server_caller(cookie_jar)
+            kwargs["parse_retries"] = self.config.cua_parse_retries
+            kwargs["parse_error_feedback"] = self.config.cua_parse_error_feedback
             if temperature is not None:
                 kwargs["temperature"] = temperature
             if top_p is not None:
@@ -216,6 +224,8 @@ class BrowserAgent(SimpleResponsesAPIAgent):
             kwargs["max_model_len"] = self.config.cua_max_model_len
             kwargs["max_output_tokens"] = self.config.cua_max_tokens
             kwargs["thinking"] = self.config.cua_thinking
+            kwargs["parse_retries"] = self.config.cua_parse_retries
+            kwargs["parse_error_feedback"] = self.config.cua_parse_error_feedback
             if temperature is not None:
                 kwargs["temperature"] = temperature
             if top_p is not None:
@@ -352,6 +362,7 @@ class BrowserAgent(SimpleResponsesAPIAgent):
                 adapter_resp = await adapter.initialize(task_prompt, screenshot_b64)
             except Exception as init_err:
                 logger.error("[CUA %s] Adapter initialize failed: %s — returning empty trajectory", env_id, init_err)
+                trajectory.termination_reason = "adapter_init_error"
                 return trajectory, "", None, None
 
             logger.info(
@@ -384,6 +395,8 @@ class BrowserAgent(SimpleResponsesAPIAgent):
             consecutive_failures = 0
             max_consecutive_failures = 3
             browser_crashed = False
+            adapter_step_error = False
+            timed_out = False
 
             while not adapter_resp.done and step_count < self.config.max_steps:
                 if browser_crashed:
@@ -397,6 +410,7 @@ class BrowserAgent(SimpleResponsesAPIAgent):
                         self.config.run_timeout_seconds,
                         step_count,
                     )
+                    timed_out = True
                     break
                 last_action_error = None
                 for action_i, action in enumerate(adapter_resp.actions):
@@ -503,6 +517,7 @@ class BrowserAgent(SimpleResponsesAPIAgent):
                         cumulative_output_tokens += adapter_resp.usage.output_tokens
                 except Exception as adapter_err:
                     logger.error("[CUA %s] Adapter step failed: %s — ending loop", env_id, adapter_err)
+                    adapter_step_error = True
                     break
 
             total_elapsed = time.time() - loop_start
@@ -515,8 +530,23 @@ class BrowserAgent(SimpleResponsesAPIAgent):
                 cumulative_output_tokens,
             )
 
-            if adapter_resp.message:
+            # An empty-string answer (terminate with no answer) is still an
+            # answer — only None means "the model never gave one".
+            if adapter_resp.message is not None:
                 trajectory.final_message = adapter_resp.message
+
+            # Record why the episode ended when it wasn't a normal model
+            # terminate — resources servers use this to mask unreliable rewards.
+            if browser_crashed:
+                trajectory.termination_reason = "browser_stuck"
+            elif adapter_step_error:
+                trajectory.termination_reason = "adapter_error"
+            elif adapter_resp.termination_reason:
+                trajectory.termination_reason = adapter_resp.termination_reason
+            elif timed_out:
+                trajectory.termination_reason = "run_timeout"
+            elif not adapter_resp.done:
+                trajectory.termination_reason = "max_steps"
 
             local_storage_dump = ""
             if browser_crashed:

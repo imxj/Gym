@@ -157,8 +157,14 @@ class CUATrajectory(BaseModel):
 
     steps: List[CUAStep] = Field(default_factory=list)
     task_prompt: str = ""
+    system_prompt: str = ""  # adapter's system prompt (needed for training token alignment)
+    first_user_text: str = ""  # exact user message text sent to LLM (for training token alignment)
     initial_screenshot: str = ""  # base64
     final_message: Optional[str] = None
+    # Why the episode ended when it did not end via a normal model terminate
+    # (e.g. "browser_stuck", "no_tool_calls", "run_timeout", "max_steps").
+    # Resources servers use it to mark rewards as unreliable (mask_sample).
+    termination_reason: Optional[str] = None
 
 
 ########################################

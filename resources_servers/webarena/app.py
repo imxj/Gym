@@ -49,7 +49,6 @@ from resources_servers.browser_gym.app import BrowserGymResourcesServer
 from resources_servers.browser_gym.schemas import (
     CUASeedSessionResponse,
     CUAVerifyRequest,
-    CUAVerifyResponse,
 )
 from resources_servers.webarena.evaluators import (
     JUDGE_SYSTEM_MESSAGE,
@@ -63,6 +62,7 @@ from resources_servers.webarena.evaluators import (
 from resources_servers.webarena.schemas import (
     WebArenaResourcesServerConfig,
     WebArenaSeedSessionRequest,
+    WebArenaVerifyResponse,
 )
 from resources_servers.webarena.site_api_helpers import (
     WebArenaSiteAPI,
@@ -187,17 +187,51 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
     # Verification
     ########################################
 
-    async def verify(self, body: CUAVerifyRequest) -> CUAVerifyResponse:
+    async def verify(self, body: CUAVerifyRequest) -> WebArenaVerifyResponse:
         vm = body.verifier_metadata or {}
         eval_cfg: Dict[str, Any] = vm.get("eval") or {}
         intent = str(vm.get("intent") or "")
         detail: Dict[str, Any] = {"messages": []}
+        masked = set(self.config.masked_termination_reasons)
+        # Verify-side infra failures collected while scoring (judge down,
+        # site unreachable, ...). Any masked entry marks the reward unreliable.
+        flags: List[str] = []
+
+        def respond(reward: float, termination_reason: Optional[str]) -> WebArenaVerifyResponse:
+            mask_sample = termination_reason in masked
+            if mask_sample:
+                detail["messages"].append(
+                    f"mask_sample=True ({termination_reason}): reward is unreliable, trainer should drop it"
+                )
+            payload = body.model_dump()
+            # Replayed rollout rows may already carry these as extras.
+            for key in ("reward", "mask_sample", "termination_reason", "verification_result"):
+                payload.pop(key, None)
+            return WebArenaVerifyResponse(
+                **payload,
+                reward=reward,
+                mask_sample=mask_sample,
+                termination_reason=termination_reason,
+                verification_result=detail,
+            )
 
         try:
+            agent_reason = self._agent_termination_reason(body)
+            if agent_reason:
+                detail["messages"].append(f"agent termination_reason: {agent_reason}")
+            if agent_reason in masked:
+                # The episode itself is unreliable (browser stuck, adapter
+                # error, parse exhaustion, ...). Skip scoring entirely — the
+                # standalone harness's "status=error, evaluation skipped".
+                detail["messages"].append("scoring skipped for masked termination reason")
+                return respond(0.0, agent_reason)
+
             eval_types = eval_cfg.get("eval_types") or []
             if not eval_types:
+                # A row that cannot be scored at all is a data problem, not a
+                # policy failure — mask it.
                 detail["messages"].append("no eval_types in verifier_metadata.eval")
-                return CUAVerifyResponse(**body.model_dump(), reward=0.0, verification_result=detail)
+                return respond(0.0, "verification_error")
 
             answer = self._final_answer(body)
             candidate_urls = self._candidate_urls(body)
@@ -205,9 +239,12 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
             detail["candidate_urls"] = candidate_urls
 
             score = 1.0
+            # (eval_type, score, had_infra_flags) — needed for causal masking.
+            components: List[tuple] = []
             for eval_type in eval_types:
+                flags_before = len(flags)
                 if eval_type == "string_match":
-                    cur_score = await self._string_match(eval_cfg, intent, answer, detail)
+                    cur_score = await self._string_match(eval_cfg, intent, answer, detail, flags)
                 elif eval_type == "url_match":
                     cur_score, matched_url, unique_urls = score_url_match_candidates(
                         eval_cfg, candidate_urls, self.config.site_urls
@@ -216,17 +253,29 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
                         f"url_match: score={cur_score}, pred={matched_url!r}, candidates={unique_urls!r}"
                     )
                 elif eval_type == "program_html":
-                    cur_score = await self._program_html(eval_cfg, candidate_urls, detail)
+                    cur_score = await self._program_html(eval_cfg, candidate_urls, detail, flags)
                 else:
                     detail["messages"].append(f"unknown eval_type: {eval_type}")
                     cur_score = 0.0
+                components.append((eval_type, cur_score, len(flags) > flags_before))
                 score *= cur_score
 
-            return CUAVerifyResponse(**body.model_dump(), reward=float(score), verification_result=detail)
+            # Causal masking: an infra flag only makes the reward unreliable if
+            # it could have determined the outcome. A full-score episode was
+            # scored despite the hiccup; an episode with a clean (unflagged)
+            # zero component failed genuinely regardless of the infra issue.
+            verify_reason = None
+            if score < 1.0 and not any(s < 1.0 and not flagged for _, s, flagged in components):
+                verify_reason = next((flag for flag in flags if flag in masked), None)
+            elif flags:
+                detail["messages"].append(
+                    f"infra flags {flags!r} did not determine the outcome — reward kept unmasked"
+                )
+            return respond(float(score), verify_reason or agent_reason)
         except Exception as e:
             logger.error("WebArena verification failed: %s: %s", type(e).__name__, e, exc_info=True)
             detail["messages"].append(f"verification error: {type(e).__name__}: {e}")
-            return CUAVerifyResponse(**body.model_dump(), reward=0.0, verification_result=detail)
+            return respond(0.0, "verification_error")
 
     @staticmethod
     def _final_answer(body: CUAVerifyRequest) -> str:
@@ -234,6 +283,21 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
         trajectory = getattr(response, "trajectory", None)
         final_message = getattr(trajectory, "final_message", None)
         return "" if final_message is None else str(final_message)
+
+    @staticmethod
+    def _agent_termination_reason(body: CUAVerifyRequest) -> Optional[str]:
+        """The agent-reported reason the episode ended abnormally, if any."""
+        trajectory = getattr(body.response, "trajectory", None)
+        reason = getattr(trajectory, "termination_reason", None)
+        if reason:
+            return str(reason)
+        # An episode with no steps and no answer never really started. An
+        # empty-string answer (terminate with no answer) still counts as an
+        # answer — only None means the model never responded.
+        steps = getattr(trajectory, "steps", None) or []
+        if not steps and getattr(trajectory, "final_message", None) is None:
+            return "empty_trajectory"
+        return None
 
     @staticmethod
     def _candidate_urls(body: CUAVerifyRequest) -> List[str]:
@@ -245,19 +309,24 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
     # string_match (+ LLM judge)
     ########################################
 
-    async def _string_match(self, eval_cfg: Dict[str, Any], intent: str, answer: str, detail: Dict[str, Any]) -> float:
+    async def _string_match(
+        self, eval_cfg: Dict[str, Any], intent: str, answer: str, detail: Dict[str, Any], flags: List[str]
+    ) -> float:
         score, pending = string_match_local(eval_cfg, intent, answer)
         for judge_request in pending:
-            score *= await self._resolve_judge_request(judge_request, detail)
+            score *= await self._resolve_judge_request(judge_request, detail, flags)
         detail["messages"].append(f"string_match: score={score}, pending_judge_requests={len(pending)}")
         return score
 
-    async def _resolve_judge_request(self, judge_request: Dict[str, str], detail: Dict[str, Any]) -> float:
+    async def _resolve_judge_request(
+        self, judge_request: Dict[str, str], detail: Dict[str, Any], flags: List[str]
+    ) -> float:
         if self.config.judge_model_server is None:
             detail["messages"].append(
                 f"judge unavailable — {judge_request['judge_type']} scored 0.0 "
                 "(configure judge_model_server to enable fuzzy matching)"
             )
+            flags.append("judge_unavailable")
             return 0.0
 
         responses_create_params = NeMoGymResponseCreateParamsNonStreaming(
@@ -278,6 +347,7 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
         except Exception as e:
             logger.warning("WebArena judge call failed: %s", e)
             detail["messages"].append(f"judge call failed ({judge_request['judge_type']}): {e}")
+            flags.append("judge_call_failed")
             return 0.0
 
         passed = judge_passed(judge_request["judge_type"], output_text)
@@ -308,7 +378,7 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
     ########################################
 
     async def _program_html(
-        self, eval_cfg: Dict[str, Any], candidate_urls: List[str], detail: Dict[str, Any]
+        self, eval_cfg: Dict[str, Any], candidate_urls: List[str], detail: Dict[str, Any], flags: List[str]
     ) -> float:
         targets = eval_cfg.get("program_html") or []
         if not targets:
@@ -333,13 +403,17 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
                         )
                         detail["messages"].append(f"program_html: resolved func url -> {target_url!r}")
                     except Exception as e:
+                        # Site-API infra failure (Magento REST down, auth token
+                        # rejected, ...) — the check could not run at all.
                         detail["messages"].append(f"program_html: func url resolution failed: {e} — scored 0.0")
+                        flags.append("site_api_error")
                         score *= 0.0
                         continue
 
                 if target_url == "last":
                     urls = candidate_urls or []
                     target_score = 0.0
+                    candidate_errors = 0
                     for candidate in urls:
                         try:
                             target_score = max(
@@ -349,12 +423,25 @@ class WebArenaResourcesServer(BrowserGymResourcesServer):
                                 break
                         except Exception as e:
                             detail["messages"].append(f"program_html candidate {candidate!r} failed: {e}")
+                            candidate_errors += 1
                     if not urls:
                         detail["messages"].append("program_html: url='last' but trajectory has no URLs")
+                    # A candidate hiccup only matters if the target never passed
+                    # afterwards — otherwise the infra failure was inconsequential.
+                    if candidate_errors and target_score < 1.0:
+                        flags.append("program_html_infra_error")
                     score *= target_score
                 else:
                     resolved = substitute_site_placeholders(target_url, self.config.site_urls)
-                    score *= await self._program_html_target(page, resolved, target, detail)
+                    try:
+                        score *= await self._program_html_target(page, resolved, target, detail)
+                    except Exception as e:
+                        # Navigation/extraction infrastructure failure — a
+                        # content mismatch never raises, so this is not a
+                        # genuine task failure.
+                        detail["messages"].append(f"program_html target {resolved!r} failed: {e} — scored 0.0")
+                        flags.append("program_html_infra_error")
+                        score *= 0.0
             return score
         finally:
             await self.browser_pool.close_session(env_id)

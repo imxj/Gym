@@ -21,6 +21,8 @@ tests pin both behaviors so a schema edit can't regress them.
 
 import json
 
+import pytest
+
 from responses_api_agents.browser_agent.adapters.vision_adapter import (
     BROWSER_ACTION_SCHEMA,
     VisionCUAAdapter,
@@ -127,3 +129,69 @@ def test_done_with_null_message_uses_fallback():
     assert result.done is True
     assert result.message == "Task completed."
     assert result.actions == []
+
+
+########################################
+# Parse retries
+########################################
+
+
+class _RecordingCaller:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.payloads = []
+
+    async def __call__(self, payload):
+        self.payloads.append(payload)
+        return self._responses.pop(0)
+
+
+def _retry_adapter(caller, **overrides) -> VisionCUAAdapter:
+    return VisionCUAAdapter(
+        model="test-model",
+        viewport_width=1000,
+        viewport_height=500,
+        api_caller=caller,
+        retry_sleep_seconds=0,
+        **overrides,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unparseable_output_retries_then_recovers():
+    valid = json.dumps(_nulls_except(action_type="click", coordinate=[0.5, 0.5]))
+    caller = _RecordingCaller([_response_with_text("total garbage"), _response_with_text(valid)])
+    adapter = _retry_adapter(caller)
+    result = await adapter.initialize("task", "S")
+
+    assert not result.done
+    assert result.actions[0].action_type == "click"
+    assert len(caller.payloads) == 2
+    # Only the accepted turn is stored in history.
+    assistant_turns = [m for m in adapter._messages if m.get("role") == "assistant"]
+    assert len(assistant_turns) == 1
+    assert assistant_turns[0]["content"] == valid
+
+
+@pytest.mark.asyncio
+async def test_unparseable_output_exhaustion_sets_termination_reason():
+    caller = _RecordingCaller([_response_with_text(f"garbage {i}") for i in range(3)])
+    result = await _retry_adapter(caller).initialize("task", "S")
+
+    assert result.done
+    assert result.termination_reason == "unparseable_action"
+    assert result.message == "garbage 2"
+    assert len(caller.payloads) == 3
+
+
+@pytest.mark.asyncio
+async def test_feedback_mode_is_transient():
+    valid = json.dumps(_nulls_except(action_type="done", message="ok"))
+    caller = _RecordingCaller([_response_with_text("garbage"), _response_with_text(valid)])
+    adapter = _retry_adapter(caller, parse_retries=2, parse_error_feedback=True)
+    result = await adapter.initialize("task", "S")
+
+    assert result.done and result.message == "ok"
+    retry_input = caller.payloads[1]["input"]
+    assert any("was not a valid action" in str(item) for item in retry_input)
+    assert not any("garbage" in str(m) for m in adapter._messages)

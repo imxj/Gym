@@ -30,6 +30,48 @@ row (verifier_metadata: start_url, eval) -> browser_agent /run
 
 The reward is the **product** over all `eval_types` (all must pass).
 
+### Reward reliability: `mask_sample` + `termination_reason`
+
+`verify()` returns a `WebArenaVerifyResponse` that extends the CUA verify
+response with the unreliable-reward contract (same shape the OSWorld
+integration uses): **`mask_sample=True` means "do not train on this reward"** —
+the episode or its verification failed for an *infrastructure* reason, so the
+0 says nothing about the policy. This formalizes the standalone harness's
+"status=error, evaluation skipped" behavior.
+
+| termination_reason | set by | masked by default |
+|---|---|---|
+| `browser_stuck`, `adapter_error`, `adapter_init_error`, `run_timeout` | browser agent loop | yes |
+| `no_tool_calls`, `unparseable_action` | adapter parse-retry exhaustion | yes |
+| `empty_trajectory` | verify (no steps, no answer) | yes |
+| `judge_unavailable`, `judge_call_failed` | verify (fuzzy_match judge) | yes |
+| `program_html_infra_error`, `site_api_error` | verify (site nav / Magento API) | yes |
+| `verification_error` | verify (unexpected exception) | yes |
+| `max_steps` | browser agent loop | **no** — running out of steps is a genuine failure (harness "fail") |
+
+The set is configurable via `masked_termination_reasons`. Scoring is skipped
+entirely for episodes arriving with a masked agent-side reason; a content
+mismatch (wrong answer, wrong URL, wrong DOM state) never masks.
+
+### Parse retries (harness parity)
+
+Both adapters call the model up to `cua_parse_retries` (default 3) times per
+step — i.e. up to 2 blind resamples after the first attempt, matching the
+internal harness's 3-attempt loop — when the output carries no parseable
+action, before ending the episode with a masked `no_tool_calls` /
+`unparseable_action` reason. Failed attempts are never persisted to history,
+so the trajectory and RL token stream only ever contain accepted turns.
+`cua_parse_error_feedback: true` switches retries from blind resamples to
+OSWorld-PR-style transient corrective messages (off by default to preserve
+harness score parity); because the corrective messages are transient, a turn
+recovered via feedback carries **no token IDs** — its prompt cannot be aligned
+with the persisted history, and misaligned log-probs are worse than none.
+
+Masking is **causal**: an infra flag raised during scoring only masks the
+reward if it could have determined the outcome. A full-score episode stays
+unmasked despite hiccups, and an episode with a clean zero (e.g. a genuine
+url_match miss) stays unmasked even if an unrelated judge call failed.
+
 `func:` expressions are parsed with `ast` (single call to an allow-listed helper,
 literal args plus `__page__` / `__last_url__` placeholders) — no `eval`. Magento
 API calls authenticate with the `shopping_admin` credentials and cache the admin

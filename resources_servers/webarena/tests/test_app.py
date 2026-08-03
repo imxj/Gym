@@ -279,12 +279,14 @@ def _make_server(monkeypatch, **config_overrides) -> WebArenaResourcesServer:
     return WebArenaResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
 
 
-def _make_verify_request(final_message, step_urls, verifier_metadata) -> CUAVerifyRequest:
+def _make_verify_request(final_message, step_urls, verifier_metadata, termination_reason=None) -> CUAVerifyRequest:
     steps = [
         CUAStep(action=BrowserAction(action_type="goto", url=url), screenshot_after="", current_url=url)
         for url in step_urls
     ]
-    trajectory = CUATrajectory(steps=steps, task_prompt="task", final_message=final_message)
+    trajectory = CUATrajectory(
+        steps=steps, task_prompt="task", final_message=final_message, termination_reason=termination_reason
+    )
     response = CUANeMoGymResponse(
         id="cua_test",
         created_at=0,
@@ -352,7 +354,7 @@ async def test_verify_string_match_exact_pass(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_verify_string_match_fail_without_judge(monkeypatch):
+async def test_verify_string_match_fail_without_judge_is_masked(monkeypatch):
     server = _make_server(monkeypatch)
     body = _make_verify_request(
         final_message="wrong answer",
@@ -364,6 +366,9 @@ async def test_verify_string_match_fail_without_judge(monkeypatch):
     )
     result = await server.verify(body)
     assert result.reward == 0.0
+    # The judge fallback could not run, so the 0 reward is unreliable.
+    assert result.mask_sample is True
+    assert result.termination_reason == "judge_unavailable"
     assert any("judge unavailable" in message for message in result.verification_result["messages"])
 
 
@@ -432,6 +437,200 @@ async def test_verify_unknown_eval_type_and_missing_eval(monkeypatch):
     body = _make_verify_request(final_message="x", step_urls=[], verifier_metadata={})
     result = await server.verify(body)
     assert result.reward == 0.0
+
+
+########################################
+# Tier 1 — mask_sample / termination-reason taxonomy
+########################################
+
+
+@pytest.mark.asyncio
+async def test_masked_agent_reason_skips_scoring(monkeypatch):
+    server = _make_server(monkeypatch)
+    body = _make_verify_request(
+        final_message=None,
+        step_urls=["http://wa-host:8023/"],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {"eval_types": ["string_match"], "reference_answers": {"exact_match": "Sprite"}},
+        },
+        termination_reason="browser_stuck",
+    )
+    result = await server.verify(body)
+    assert result.reward == 0.0
+    assert result.mask_sample is True
+    assert result.termination_reason == "browser_stuck"
+    assert any("scoring skipped" in m for m in result.verification_result["messages"])
+    # No judge request was ever attempted.
+    assert "judge_evaluations" not in result.verification_result
+
+
+@pytest.mark.asyncio
+async def test_genuine_failure_is_not_masked(monkeypatch):
+    server = _make_server(monkeypatch)
+    # url_match miss needs no judge: a real, reliable 0.
+    body = _make_verify_request(
+        final_message=None,
+        step_urls=["http://wa-host:8023/elsewhere"],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {"eval_types": ["url_match"], "reference_url": "__GITLAB__/dashboard/todos"},
+        },
+    )
+    result = await server.verify(body)
+    assert result.reward == 0.0
+    assert result.mask_sample is False
+    assert result.termination_reason is None
+
+
+@pytest.mark.asyncio
+async def test_max_steps_is_scored_not_masked(monkeypatch):
+    # Harness parity: running out of steps is a genuine failure ("fail"),
+    # not an infrastructure error.
+    server = _make_server(monkeypatch)
+    body = _make_verify_request(
+        final_message=None,
+        step_urls=["http://wa-host:8023/dashboard/todos"],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {"eval_types": ["url_match"], "reference_url": "__GITLAB__/dashboard/todos"},
+        },
+        termination_reason="max_steps",
+    )
+    result = await server.verify(body)
+    assert result.reward == 1.0  # the trajectory did reach the reference URL
+    assert result.mask_sample is False
+    assert result.termination_reason == "max_steps"
+
+
+@pytest.mark.asyncio
+async def test_empty_trajectory_is_masked(monkeypatch):
+    server = _make_server(monkeypatch)
+    body = _make_verify_request(
+        final_message=None,
+        step_urls=[],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {"eval_types": ["url_match"], "reference_url": "__GITLAB__/x"},
+        },
+    )
+    result = await server.verify(body)
+    assert result.mask_sample is True
+    assert result.termination_reason == "empty_trajectory"
+
+
+@pytest.mark.asyncio
+async def test_judge_call_failure_is_masked(monkeypatch):
+    server = _make_server(
+        monkeypatch,
+        judge_model_server=ModelServerRef(type="responses_api_models", name="webarena_judge_model"),
+    )
+    server.server_client.post = AsyncMock(side_effect=RuntimeError("judge endpoint down"))
+    body = _make_verify_request(
+        final_message="roughly thirty dollars",
+        step_urls=[],
+        verifier_metadata={
+            "intent": "How much is shipping?",
+            "eval": {"eval_types": ["string_match"], "reference_answers": {"fuzzy_match": ["around $30"]}},
+        },
+    )
+    result = await server.verify(body)
+    assert result.reward == 0.0
+    assert result.mask_sample is True
+    assert result.termination_reason == "judge_call_failed"
+
+
+@pytest.mark.asyncio
+async def test_infra_flag_does_not_mask_a_genuine_zero(monkeypatch):
+    # Causal masking: url_match misses cleanly (no judge involved) while the
+    # string_match component would need the (unavailable) judge. The zero is
+    # already determined by the clean miss, so the reward stays unmasked.
+    server = _make_server(monkeypatch)
+    body = _make_verify_request(
+        final_message="some answer",
+        step_urls=["http://wa-host:8023/elsewhere"],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {
+                "eval_types": ["url_match", "string_match"],
+                "reference_url": "__GITLAB__/dashboard/todos",
+                "reference_answers": {"fuzzy_match": ["around $30"]},
+            },
+        },
+    )
+    result = await server.verify(body)
+    assert result.reward == 0.0
+    assert result.mask_sample is False
+    assert any("did not determine the outcome" in m for m in result.verification_result["messages"])
+
+
+@pytest.mark.asyncio
+async def test_replayed_body_with_reward_extras_does_not_crash(monkeypatch):
+    # Rollout rows already contain reward/mask_sample; replaying one through
+    # verify() must not raise duplicate-keyword errors.
+    server = _make_server(monkeypatch)
+    body = _make_verify_request(
+        final_message="Sprite",
+        step_urls=[],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {"eval_types": ["string_match"], "reference_answers": {"exact_match": "Sprite"}},
+        },
+    )
+    replayed = CUAVerifyRequest.model_validate(
+        body.model_dump() | {"reward": 0.5, "mask_sample": True, "termination_reason": "stale"}
+    )
+    result = await server.verify(replayed)
+    assert result.reward == 1.0
+    assert result.mask_sample is False
+
+
+@pytest.mark.asyncio
+async def test_missing_eval_types_is_masked(monkeypatch):
+    server = _make_server(monkeypatch)
+    body = _make_verify_request(final_message="x", step_urls=[], verifier_metadata={})
+    result = await server.verify(body)
+    assert result.reward == 0.0
+    assert result.mask_sample is True
+    assert result.termination_reason in ("verification_error", "empty_trajectory")
+
+
+@pytest.mark.asyncio
+async def test_empty_string_answer_is_not_empty_trajectory(monkeypatch):
+    # terminate(status=failure) with no answer yields final_message="" — a
+    # genuine failure, not a never-started episode.
+    server = _make_server(monkeypatch)
+    body = _make_verify_request(
+        final_message="",
+        step_urls=[],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {"eval_types": ["url_match"], "reference_url": "__GITLAB__/x"},
+        },
+    )
+    result = await server.verify(body)
+    assert result.reward == 0.0
+    assert result.mask_sample is False
+    assert result.termination_reason is None
+
+
+@pytest.mark.asyncio
+async def test_mask_reasons_are_configurable(monkeypatch):
+    server = _make_server(monkeypatch, masked_termination_reasons=[])
+    body = _make_verify_request(
+        final_message=None,
+        step_urls=["http://wa-host:8023/dashboard/todos"],
+        verifier_metadata={
+            "intent": "i",
+            "eval": {"eval_types": ["url_match"], "reference_url": "__GITLAB__/dashboard/todos"},
+        },
+        termination_reason="browser_stuck",
+    )
+    result = await server.verify(body)
+    # With the reason unmasked, the episode is scored normally.
+    assert result.mask_sample is False
+    assert result.reward == 1.0
+    assert result.termination_reason == "browser_stuck"
 
 
 @pytest.mark.asyncio

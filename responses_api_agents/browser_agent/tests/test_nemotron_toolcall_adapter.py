@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the Nemotron tool-call CUA adapter (no model, no browser)."""
 
+import json
 from typing import Any, Dict, List
 
 import pytest
@@ -180,13 +181,131 @@ async def test_terminate_ends_episode_with_answer_as_message():
     assert result.actions == []
 
 
+def _no_tool_call_response(text: str = "hm") -> Dict[str, Any]:
+    return {"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]}
+
+
 @pytest.mark.asyncio
-async def test_no_tool_call_ends_episode():
-    caller = _RecordingCaller(
-        [{"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hm"}]}]}]
-    )
-    result = await _adapter(caller).initialize("t", "S")
+async def test_no_tool_call_ends_episode_when_retries_disabled():
+    caller = _RecordingCaller([_no_tool_call_response()])
+    result = await _adapter(caller, parse_retries=1, retry_sleep_seconds=0).initialize("t", "S")
     assert result.done and result.message == "hm"
+    assert result.termination_reason == "no_tool_calls"
+
+
+########################################
+# Parse retries (harness parity: 3 blind resamples)
+########################################
+
+
+@pytest.mark.asyncio
+async def test_parse_retry_recovers_and_keeps_history_clean():
+    caller = _RecordingCaller(
+        [
+            _no_tool_call_response("oops 1"),
+            _no_tool_call_response("oops 2"),
+            _tool_call_response("computer", '{"actions": [{"action": "left_click", "coordinate": [0.5, 0.5]}]}'),
+        ]
+    )
+    adapter = _adapter(caller, retry_sleep_seconds=0)
+    result = await adapter.initialize("t", "S")
+
+    assert not result.done
+    assert result.termination_reason is None
+    assert [a.action_type for a in result.actions] == ["click"]
+    assert len(caller.payloads) == 3
+    # Blind resample: retry payloads are identical to the first attempt's.
+    assert caller.payloads[1]["input"] == caller.payloads[0]["input"]
+    # Only the ACCEPTED assistant turn reaches history — no failed attempts.
+    assistant_items = [i for i in adapter._input_items if i.get("type") in ("message", "function_call")]
+    assistant_items = [i for i in assistant_items if i.get("role") != "user"]
+    assert len(assistant_items) == 1
+    assert assistant_items[0]["type"] == "function_call"
+
+
+@pytest.mark.asyncio
+async def test_parse_retry_exhaustion_masks_episode():
+    caller = _RecordingCaller([_no_tool_call_response(f"try {i}") for i in range(3)])
+    result = await _adapter(caller, retry_sleep_seconds=0).initialize("t", "S")
+
+    assert result.done
+    assert result.termination_reason == "no_tool_calls"
+    assert result.message == "try 2"  # last attempt's prose
+    assert len(caller.payloads) == 3
+
+
+@pytest.mark.asyncio
+async def test_terminate_with_preceding_actions_drops_them():
+    # The agent loop never executes actions once done=True; returning them
+    # would misrepresent the episode (and the harness would have executed
+    # them, so this is logged loudly).
+    response = {
+        "output": [
+            {
+                "type": "function_call",
+                "name": "computer",
+                "arguments": '{"actions": [{"action": "left_click", "coordinate": [0.5, 0.5]}]}',
+                "call_id": "call_a",
+            },
+            {
+                "type": "function_call",
+                "name": "terminate",
+                "arguments": '{"status": "success", "answer": "done"}',
+                "call_id": "call_b",
+            },
+        ]
+    }
+    result = await _adapter(_RecordingCaller([response]), retry_sleep_seconds=0).initialize("t", "S")
+    assert result.done and result.message == "done"
+    assert result.actions == []
+
+
+@pytest.mark.asyncio
+async def test_feedback_recovery_strips_token_ids():
+    valid = _tool_call_response("terminate", '{"status": "success", "answer": "42"}')
+    valid["output"][-1]["prompt_token_ids"] = [1, 2, 3]
+    valid["output"][-1]["generation_token_ids"] = [4, 5]
+    valid["output"][-1]["generation_log_probs"] = [-0.1, -0.2]
+
+    # Blind-resample recovery keeps token IDs (prompt unchanged)...
+    caller = _RecordingCaller([_no_tool_call_response(), json.loads(json.dumps(valid))])
+    result = await _adapter(caller, retry_sleep_seconds=0).initialize("t", "S")
+    assert result.prompt_token_ids == [1, 2, 3]
+
+    # ...feedback-mode recovery must not: its prompt included transient
+    # messages that are absent from persisted history.
+    caller = _RecordingCaller([_no_tool_call_response(), json.loads(json.dumps(valid))])
+    result = await _adapter(caller, parse_error_feedback=True, retry_sleep_seconds=0).initialize("t", "S")
+    assert result.prompt_token_ids == []
+    assert result.generation_token_ids == []
+    assert result.message == "42"  # the recovery itself still works
+
+
+@pytest.mark.asyncio
+async def test_parse_retry_feedback_mode_sends_transient_correction():
+    caller = _RecordingCaller(
+        [
+            _no_tool_call_response("bad output"),
+            _tool_call_response("terminate", '{"status": "success", "answer": "42"}'),
+        ]
+    )
+    adapter = _adapter(caller, parse_retries=2, parse_error_feedback=True, retry_sleep_seconds=0)
+    result = await adapter.initialize("t", "S")
+
+    assert result.done and result.message == "42"
+    # Retry payload carries the failed output plus the corrective user message...
+    retry_texts = [
+        part.get("text", "")
+        for item in caller.payloads[1]["input"]
+        if isinstance(item.get("content"), list)
+        for part in item["content"]
+        if isinstance(part, dict)
+    ]
+    assert any("did not contain a valid tool call" in t for t in retry_texts)
+    # ...but neither is persisted: history has no trace of the failed attempt.
+    history_json = str(adapter._input_items)
+    assert "bad output" not in history_json
+    assert "did not contain a valid tool call" not in history_json
 
 
 @pytest.mark.asyncio

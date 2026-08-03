@@ -39,6 +39,10 @@ class CUAAdapterResponse(BaseModel):
     message: Optional[str] = None
     raw_response: Dict[str, Any] = Field(default_factory=dict)
     done: bool = False
+    # Set when the adapter ends the episode for a reason other than the model
+    # terminating normally (e.g. "no_tool_calls", "unparseable_action").
+    # Resources servers use it to mark the reward as unreliable (mask_sample).
+    termination_reason: Optional[str] = None
     usage: Optional[CUAAdapterUsage] = None
     prompt_token_ids: List[int] = Field(default_factory=list)
     generation_token_ids: List[int] = Field(default_factory=list)

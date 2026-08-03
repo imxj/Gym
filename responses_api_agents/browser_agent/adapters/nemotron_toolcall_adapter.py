@@ -39,10 +39,11 @@ rather than pyautogui, and there is no captcha handler.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from resources_servers.browser_gym.schemas import BrowserAction
 from responses_api_agents.browser_agent.adapters.base import (
@@ -286,6 +287,14 @@ _CLICK_ACTIONS = {
 # Scroll wheel clicks -> pixels, matching the harness's pyautogui scroll scale.
 SCROLL_PIXELS_PER_CLICK = 100
 
+# Sent (transiently, never persisted to history) when parse_error_feedback is
+# enabled and the previous attempt produced no tool call.
+PARSE_RETRY_FEEDBACK = (
+    "Your previous response did not contain a valid tool call. Respond by calling "
+    "exactly one of the available tools (`navigate`, `computer`, `tabs_create`, "
+    "`tabs_focus`, or `terminate`)."
+)
+
 
 def decode_arguments(raw: Any) -> Dict[str, Any]:
     """Tool-call arguments arrive as a JSON string (or already-parsed dict)."""
@@ -315,6 +324,9 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         thinking: bool = True,
+        parse_retries: int = 3,
+        parse_error_feedback: bool = False,
+        retry_sleep_seconds: float = 1.0,
         api_caller=None,
     ):
         self._model = model
@@ -326,6 +338,13 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
         self._temperature = temperature
         self._top_p = top_p
         self._thinking = thinking
+        # Harness parity (nemotron_toolcall_agent.py): up to 3 attempts per
+        # step when the response carries no tool call, as blind resamples.
+        # parse_error_feedback=False keeps that parity; True switches to
+        # OSWorld-PR-style transient error feedback on retries.
+        self._parse_retries = max(1, parse_retries)
+        self._parse_error_feedback = parse_error_feedback
+        self._retry_sleep_seconds = retry_sleep_seconds
         self._api_caller = api_caller
 
         self._input_items: List[Dict[str, Any]] = []
@@ -359,11 +378,11 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
             ],
         }
 
-    def _build_payload(self) -> Dict[str, Any]:
+    def _build_payload(self, extra_items: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self._model,
             "instructions": SYSTEM_PROMPT,
-            "input": self._compact_input_items(),
+            "input": self._compact_input_items() + list(extra_items or []),
             "tools": copy.deepcopy(TOOL_DEFINITIONS),
             "max_output_tokens": self._max_output_tokens,
             # Harness parity: keep prior thinking blocks in the rendered prompt.
@@ -594,14 +613,21 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
     # Response parsing
     ########################################
 
-    def _parse_response(self, response: Dict[str, Any]) -> CUAAdapterResponse:
+    @staticmethod
+    def _extract_output(
+        response: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
+        """Pure extraction: (history echo items, assistant text, tool calls)."""
         output = response.get("output", []) or []
+        echo_items: List[Dict[str, Any]] = []
         text_chunks: List[str] = []
         tool_calls: List[Dict[str, Any]] = []
 
         for item in output:
             if not isinstance(item, dict):
                 continue
+            if item.get("type") in ("message", "function_call", "reasoning"):
+                echo_items.append(item)
             if item.get("type") == "function_call":
                 tool_calls.append(item)
             elif item.get("type") == "message" and item.get("role") == "assistant":
@@ -609,12 +635,22 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
                     if isinstance(block, dict) and block.get("type") == "output_text":
                         text_chunks.append(block.get("text", ""))
 
-        assistant_text = "".join(text_chunks)
+        return echo_items, "".join(text_chunks), tool_calls
 
-        # Echo the assistant turn back into history so the next request carries it.
-        for item in output:
-            if isinstance(item, dict) and item.get("type") in ("message", "function_call", "reasoning"):
-                self._input_items.append(copy.deepcopy(item))
+    def _finalize(
+        self,
+        response: Dict[str, Any],
+        echo_items: List[Dict[str, Any]],
+        assistant_text: str,
+        tool_calls: List[Dict[str, Any]],
+        termination_reason: Optional[str] = None,
+        strip_token_ids: bool = False,
+    ) -> CUAAdapterResponse:
+        """Commit the accepted assistant turn to history and map its actions."""
+        # Echo the assistant turn back into history so the next request carries
+        # it. Discarded retry attempts never reach this point.
+        for item in echo_items:
+            self._input_items.append(copy.deepcopy(item))
 
         actions: List[BrowserAction] = []
         done = False
@@ -631,15 +667,20 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
                 done = True
                 # The answer is what string_match scores; fall back to any prose.
                 message = args.get("answer") or assistant_text or ""
+                if actions:
+                    # The agent loop never executes actions once done=True, so
+                    # returning them would silently misrepresent the episode.
+                    logger.warning("terminate accompanied by %d unexecuted action(s); dropping them", len(actions))
+                    actions = []
                 break
             actions.extend(self._map_tool_call(name, args))
 
         if not tool_calls:
-            # No tool call: the harness treats this as a failed step. End the
-            # episode with whatever prose the model produced.
+            # Parse retries exhausted (see _request_with_retries): end the
+            # episode with whatever prose the model produced, and mark why.
             done = True
             message = assistant_text
-            logger.warning("Model returned no tool calls; ending episode")
+            termination_reason = termination_reason or "no_tool_calls"
 
         usage = None
         resp_usage = response.get("usage")
@@ -648,17 +689,71 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
             out_tok = resp_usage.get("output_tokens", 0) or 0
             usage = CUAAdapterUsage(input_tokens=in_tok, output_tokens=out_tok, total_tokens=in_tok + out_tok)
 
-        token_ids = extract_token_ids_from_response(response)
+        if strip_token_ids:
+            # Feedback-mode recovery: the accepted call's prompt included
+            # transient messages that are never persisted to history, so its
+            # token IDs cannot be aligned with the recorded context. Better no
+            # training tokens than misaligned ones.
+            token_ids = {"prompt_token_ids": [], "generation_token_ids": [], "generation_log_probs": []}
+        else:
+            token_ids = extract_token_ids_from_response(response)
         return CUAAdapterResponse(
             actions=actions,
             message=message,
             raw_response=response,
             done=done,
+            termination_reason=termination_reason,
             usage=usage,
             prompt_token_ids=token_ids["prompt_token_ids"],
             generation_token_ids=token_ids["generation_token_ids"],
             generation_log_probs=token_ids["generation_log_probs"],
         )
+
+    async def _request_with_retries(self) -> CUAAdapterResponse:
+        """Call the model, resampling up to parse_retries times on no-tool-call.
+
+        Matches the harness's 3-attempt loop (blind resample, unchanged
+        messages, brief sleep). With parse_error_feedback the retry request
+        additionally carries the failed output plus a corrective user message —
+        transient only: neither is persisted to history, so the accepted turn
+        is the only one the trajectory ever sees.
+        """
+        extra_items: List[Dict[str, Any]] = []
+        response: Dict[str, Any] = {}
+        echo_items: List[Dict[str, Any]] = []
+        assistant_text = ""
+
+        for attempt in range(self._parse_retries):
+            response = await self._call_api(self._build_payload(extra_items))
+            echo_items, assistant_text, tool_calls = self._extract_output(response)
+            if tool_calls:
+                if attempt:
+                    logger.info("Recovered a tool call on parse retry %d", attempt + 1)
+                return self._finalize(
+                    response,
+                    echo_items,
+                    assistant_text,
+                    tool_calls,
+                    # Feedback retries change the prompt the accepted call saw.
+                    strip_token_ids=bool(attempt and self._parse_error_feedback),
+                )
+
+            logger.warning("Model returned no tool calls (attempt %d/%d)", attempt + 1, self._parse_retries)
+            if attempt + 1 < self._parse_retries:
+                if self._parse_error_feedback:
+                    extra_items = [
+                        *echo_items,
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": PARSE_RETRY_FEEDBACK}],
+                        },
+                    ]
+                if self._retry_sleep_seconds > 0:
+                    await asyncio.sleep(self._retry_sleep_seconds)
+
+        logger.warning("Parse retries exhausted (%d attempts); ending episode", self._parse_retries)
+        return self._finalize(response, echo_items, assistant_text, [], termination_reason="no_tool_calls")
 
     ########################################
     # BaseCUAAdapter interface
@@ -674,7 +769,7 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
         self._task_prompt = task_prompt
         self._step_num = 1
         self._input_items.append(self._user_turn(screenshot_b64))
-        return self._parse_response(await self._call_api(self._build_payload()))
+        return await self._request_with_retries()
 
     async def step(
         self, screenshot_b64: str, action_result: Optional[str] = None, action_error: Optional[str] = None
@@ -691,7 +786,7 @@ class NemotronToolCallAdapter(BaseCUAAdapter):
 
         self._step_num += 1
         self._input_items.append(self._user_turn(screenshot_b64))
-        return self._parse_response(await self._call_api(self._build_payload()))
+        return await self._request_with_retries()
 
     def reset(self):
         self._input_items = []
